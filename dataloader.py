@@ -62,7 +62,7 @@ def cosine_schedule(T, s=0.008):
         "sqrt_one_minus_alphas_cumprod": torch.sqrt(1.0 - alphas_cumprod[1:]),
     }
 
-class MNISTdatasetDiffusion(Dataset):
+class DiffusionDataset(Dataset):
     def __init__(self, file_path:str, mode:str, steps, schedule="linear",*args, **kwargs):
         super().__init__(*args, **kwargs)
         
@@ -81,7 +81,9 @@ class MNISTdatasetDiffusion(Dataset):
             transforms.Resize(size=(32,32), antialias=False),
         ])
         
-        self.x = np.expand_dims(data[f"x_{self.mode}"],axis=-1)
+        self.x = data[f"x_{self.mode}"]
+        if self.x.ndim == 3:
+            self.x = np.expand_dims(self.x,axis=-1)
         self.y = data[f"y_{self.mode}"]        
         del data
         
@@ -128,19 +130,46 @@ class MNISTdatasetDiffusion(Dataset):
         noisy_image, noise = self.convert(self.transform(self.x[idx]),t)
         return noisy_image, noise, t + 1, self.y[idx]
 
+def display_image(noisy_image, noise, time):
+    batch = noisy_image.shape[0]
+    fig, axes = plt.subplots(batch, 2, figsize=(4, 2 * batch))
+        
+    if batch == 1:
+        axes = np.expand_dims(axes,0)
+    
+    noisy_image = noisy_image.permute(0, 2, 3, 1).cpu().numpy()
+    noise = noise.permute(0, 2, 3, 1).cpu().numpy()
+
+    noisy_image = (noisy_image - noisy_image.min()) / (noisy_image.max() - noisy_image.min())
+    noise = (noise - noise.min()) / (noise.max() - noise.min())
+    
+    for i in range(batch):
+        noisy_single = noisy_image[i]
+        noise_single = noise[i]
+        
+        axes[i][0].imshow(noisy_single)
+        axes[i][0].set_title(f"Noisy image (t={time[i]})" if time is not None else "Noisy image")
+        axes[i][0].axis("off")
+
+        axes[i][1].imshow(noise_single)
+        axes[i][1].set_title("Noise")
+        axes[i][1].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
 if __name__=="__main__":
     
+    diff_dataset = DiffusionDataset(file_path="cifar10_data.pkl", mode="train", steps=1000, schedule="cosine")
+    diff_dataloader = DataLoader(diff_dataset, batch_size=8, shuffle=True, num_workers=4)
     
-    mnist_dataset = MNISTdatasetDiffusion(file_path="mnist_data.pkl", mode="train", steps=1000)
-    mnist_dataloader = DataLoader(mnist_dataset, batch_size=8, shuffle=True, num_workers=4)
+    print(f"Length of DataLoader : {len(diff_dataloader)}")
     
-    print(f"Length of DataLoader : {len(mnist_dataloader)}")
-    
-    for i,batch in tqdm(enumerate(mnist_dataloader)):
-        noisy_image, noise, time = batch
+    for i,batch in tqdm(enumerate(diff_dataloader)):
+        noisy_image, noise, time, label = batch
         print(noisy_image.shape, noise.shape , time)
-        display_image_cifar_scaled(noisy_image, noise, time)
-        # break 
+        display_image(noisy_image, noise, time)
+        break 
 
 
     
