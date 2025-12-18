@@ -1,0 +1,13 @@
+model_repo.py
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.vscode/
+.idea/
+weights/
+weights_2/
+weights_3/
+weights_4/
+weights_5/
+fun/
