@@ -85,7 +85,7 @@ class UNET(nn.Module):
         
         self.TransConv3 = nn.ConvTranspose2d(in_channels=8, out_channels=8, kernel_size=2, stride=2)
         self.Upblock3 = nn.Sequential(ResBlock(in_channels=16, out_channels=16, tdim=time_dim))
-        self.final_conv = nn.Conv2d(16, 1, kernel_size=1) 
+        self.final_conv = nn.Conv2d(in_channels=16, out_channels=image_channels, kernel_size=1) 
         
         self.tdim = time_dim
         self.time_mlp = nn.Sequential(
