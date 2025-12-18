@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam,AdamW
 import os 
-from dataloader import MNISTdatasetDiffusion
+from dataloader import DiffusionDataset
 from model import UNET, UNET_old
 from torch.utils.data import DataLoader
 import argparse
@@ -41,8 +41,8 @@ def train(args, config=None, resume=False):
     
     
     # Load datasets
-    train_dataset = MNISTdatasetDiffusion(file_path=args.train_file_path, mode="train", steps=args.steps)
-    val_dataset = MNISTdatasetDiffusion(file_path=args.val_file_path, mode="test", steps=args.steps)
+    train_dataset = DiffusionDataset(file_path=args.train_file_path, mode="train", steps=args.steps)
+    val_dataset = DiffusionDataset(file_path=args.val_file_path, mode="test", steps=args.steps)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=args.shuffle)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
@@ -178,6 +178,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--train_file_path", type=str, default="mnist_data.pkl")
     parser.add_argument("--val_file_path", type=str, default="mnist_data.pkl")
+    parser.add_argument("--schedule", type=str, choices=["linear","cosine"])
 
     parser.add_argument("--steps", type=int, default=1000)
 
