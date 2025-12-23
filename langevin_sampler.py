@@ -4,9 +4,6 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from dataloader import linear_schedule, cosine_schedule
 
-# ----------------------------
-# CONFIG
-# ----------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 weights_path = "weights_5/best_model.pt"
@@ -18,10 +15,9 @@ model = UNET(image_channels=training_config['img_ch'],
 model.load_state_dict(weights["model_state_dict"])
 model.eval()
 
-batch_size = 5
+batch_size = 6
 steps = training_config['steps']
 image_size = 32
-
 try:
     schedule = training_config['schedule']
     if schedule == "linear":
@@ -41,13 +37,15 @@ except KeyError:
     alpha_t = data['alphas']
     alpha_t_dash = data['alphas_cumprod']
 
+
 print(f"Steps : {steps} | Schedule : {schedule}")
 
-# ----------------------------
-# REVERSE DIFFUSION
-# ----------------------------
 new_image = torch.randn(size=(batch_size, training_config['img_ch'], image_size, image_size), device=device)
 images = [[] for _ in range(batch_size)]  # each sublist holds frames for one sample
+
+M = 5
+
+sqrt_one_minus_alphas_cumprod = data['sqrt_one_minus_alphas_cumprod']
 
 with torch.no_grad():
     for time_step in reversed(range(1, steps + 1)):
@@ -57,8 +55,9 @@ with torch.no_grad():
         predicted_noise = model(new_image, t)
 
         z = torch.randn_like(predicted_noise)
-        if time_step < 100:
+        if time_step == 1:
             z = 0
+            
         a_t = alpha_t[t_idx]
         a_dash_t = alpha_t_dash[t_idx]
         a_dash_t_minus_one = alpha_t_dash[t_idx-1]
@@ -69,6 +68,16 @@ with torch.no_grad():
             * (new_image - ((1 - a_t) / torch.sqrt(1 - a_dash_t)) * predicted_noise)
             + ((1-a_t)*(1-a_dash_t) / (1-a_dash_t_minus_one)) * z
         )
+        
+        for m in range(M):
+            t_idx = t_idx - 1
+            t = torch.tensor(time_step - 1, dtype=torch.float32, device=device).view(1, 1, 1, 1)
+
+            predicted_noise = model(new_image, t)
+            pred_score = - ( predicted_noise / sqrt_one_minus_alphas_cumprod[t_idx] )
+
+            eps = 10e-5 * (sqrt_one_minus_alphas_cumprod[t_idx]**2 / sqrt_one_minus_alphas_cumprod[0]**2)
+            new_image = new_image + eps * pred_score + torch.sqrt(2*eps)*torch.randn_like(new_image)
 
         # Normalize batch for visualization
         min_val = new_image.amin(dim=(1, 2, 3), keepdim=True)
@@ -105,9 +114,9 @@ with torch.no_grad():
                         chans.append(chans[-1])  # duplicate last channel
                     stacked = np.stack(chans[:3], axis=-1)  # (H, W, 3)
                     images[i].append(stacked.astype(np.float32))
-# ----------------------------
-# ANIMATION SETUP
-# ----------------------------
+
+print(len(images[0]))
+
 fig, axes = plt.subplots(1, batch_size, figsize=(batch_size * 3, 3))
 if batch_size == 1:
     axes = [axes]
@@ -134,7 +143,7 @@ ani = animation.FuncAnimation(
     fig,
     update_frame,
     frames=len(images[0]),
-    interval=1,  # increased to 50ms for visible frames; change as desired
+    interval=2,  # increased to 50ms for visible frames; change as desired
     blit=True,
 )
 

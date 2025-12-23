@@ -45,7 +45,7 @@ def cosine_schedule(T, s=0.008):
     x = torch.linspace(0, T, steps)
 
     # compute f(t)
-    alphas_cumprod = torch.cos(((x / T) + s) / (1 + s) * math.pi / 2) ** 2
+    alphas_cumprod = torch.cos((((x / T) + s) / (1 + s)) * (math.pi / 2)) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]  # normalize so ᾱ₀ = 1
 
     # derive betas
@@ -160,7 +160,7 @@ def display_image(noisy_image, noise, time):
 
 if __name__=="__main__":
     
-    diff_dataset = DiffusionDataset(file_path="cifar10_data.pkl", mode="train", steps=1000, schedule="cosine")
+    diff_dataset = DiffusionDataset(file_path="mnist_data.pkl", mode="train", steps=1000, schedule="linear")
     diff_dataloader = DataLoader(diff_dataset, batch_size=8, shuffle=True, num_workers=4)
     
     print(f"Length of DataLoader : {len(diff_dataloader)}")
