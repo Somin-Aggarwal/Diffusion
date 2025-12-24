@@ -50,39 +50,18 @@ sqrt_one_minus_alphas_cumprod = data['sqrt_one_minus_alphas_cumprod']
 
 with torch.no_grad():
     for time_step in tqdm(reversed(range(1, steps + 1))):
-        t_idx = time_step - 1
-        t = torch.tensor(time_step, dtype=torch.float32, device=device).view(1, 1, 1, 1)
+        for m in range(M):
+            t_idx = time_step - 1
+            t = torch.tensor(time_step, dtype=torch.float32, device=device).view(1, 1, 1, 1)
 
-        predicted_noise = model(new_image, t)
+            predicted_noise = model(new_image, t)
+            pred_score = - ( predicted_noise / sqrt_one_minus_alphas_cumprod[t_idx] )
 
-        z = torch.randn_like(predicted_noise)
-        if time_step == 1:
-            z = 0
+            # eps = 10e-5 * (sqrt_one_minus_alphas_cumprod[t_idx]**2 / sqrt_one_minus_alphas_cumprod[0]**2)
             
-        a_t = alpha_t[t_idx]
-        a_dash_t = alpha_t_dash[t_idx]
-        a_dash_t_minus_one = alpha_t_dash[t_idx-1]
-        b_t = beta_t[t_idx]
-
-        new_image = (
-            (1 / torch.sqrt(a_t))
-            * (new_image - ((1 - a_t) / torch.sqrt(1 - a_dash_t)) * predicted_noise)
-            + torch.sqrt((1-a_t)*(1-a_dash_t_minus_one) / (1-a_dash_t)) * z
-        )
-        
-        if time_step > 1:
-            for m in range(M):
-                t_idx = t_idx - 1
-                t = torch.tensor(time_step - 1, dtype=torch.float32, device=device).view(1, 1, 1, 1)
-
-                predicted_noise = model(new_image, t)
-                pred_score = - ( predicted_noise / sqrt_one_minus_alphas_cumprod[t_idx] )
-
-                # eps = 10e-5 * (sqrt_one_minus_alphas_cumprod[t_idx]**2 / sqrt_one_minus_alphas_cumprod[0]**2)
-                
-                alpha_bar_curr = alpha_t_dash[t_idx]
-                eps = 2 * 10e-5 * (alpha_bar_curr)
-                new_image = new_image + eps * pred_score + torch.sqrt(2*eps)*torch.randn_like(new_image)
+            alpha_bar_curr = alpha_t_dash[t_idx]
+            eps = 1e-5 * (1-alpha_t_dash[t_idx])/(1-alpha_t_dash[0])
+            new_image = new_image + eps * pred_score + torch.sqrt(2*eps)*torch.randn_like(new_image)
 
         # Normalize batch for visualization
         min_val = new_image.amin(dim=(1, 2, 3), keepdim=True)

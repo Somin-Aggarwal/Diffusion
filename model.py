@@ -128,6 +128,61 @@ class UNET(nn.Module):
         
         return output
 
+
+class MNISTClassifier(nn.Module):
+    def __init__(self, image_channels, time_dim, num_classes=10):
+        super().__init__()
+        
+        self.image_channels = image_channels
+        self.time_dim = time_dim
+        
+        # Time MLP (Same as your UNet to stay "noise-aware")
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, time_dim),
+            nn.GELU(), # GELU often performs better for Diffusion-related tasks
+            nn.Linear(time_dim, time_dim)
+        )
+        
+        # Encoder (Downsampling path)
+        self.block1 = ResBlock(in_channels=image_channels, out_channels=32, tdim=time_dim)
+        self.maxpool1 = nn.MaxPool2d(kernel_size=2) # 28x28 -> 14x14
+
+        self.block2 = ResBlock(in_channels=32, out_channels=64, tdim=time_dim)
+        self.maxpool2 = nn.MaxPool2d(kernel_size=2) # 14x14 -> 7x7
+
+        self.block3 = ResBlock(in_channels=64, out_channels=128, tdim=time_dim)
+        self.maxpool3 = nn.MaxPool2d(kernel_size=2) # 7x7 -> 3x3
+
+        # Classifier Head
+        self.global_pool = nn.AdaptiveAvgPool2d(1) # Collapses 3x3 to 1x1
+        self.fc_head = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x, t):
+        # Time embedding
+        t = t.view(-1, 1).float()                  
+        t_emb = self.time_mlp(t)       
+                    
+        # Feature Extraction
+        x = self.block1(x, t_emb)
+        x = self.maxpool1(x)
+        
+        x = self.block2(x, t_emb)
+        x = self.maxpool2(x)
+        
+        x = self.block3(x, t_emb)
+        x = self.maxpool3(x)
+        
+        # Classification
+        x = self.global_pool(x) # Shape: [Batch, 128, 1, 1]
+        x = x.view(x.shape[0], -1) # Flatten: [Batch, 128]
+        
+        logits = self.fc_head(x)
+        return logits
+
 class UNET_old(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
