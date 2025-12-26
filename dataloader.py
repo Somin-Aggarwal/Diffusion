@@ -160,7 +160,7 @@ def display_image(noisy_image, noise, time):
 
 if __name__=="__main__":
     
-    diff_dataset = DiffusionDataset(file_path="mnist_data.pkl", mode="train", steps=1000, schedule="linear")
+    diff_dataset = DiffusionDataset(file_path="cifar10_data.pkl", mode="train", steps=1000, schedule="cosine")
     diff_dataloader = DataLoader(diff_dataset, batch_size=8, shuffle=True, num_workers=4)
     
     print(f"Length of DataLoader : {len(diff_dataloader)}")

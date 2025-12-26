@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.optim import Adam,AdamW
 import os 
 from dataloader import DiffusionDataset
-from model import UNET, UNET_old
+from model import UNET, UNET_Cifar10
 from torch.utils.data import DataLoader
 import argparse
 from tqdm import tqdm
@@ -41,14 +41,18 @@ def train(args, config=None, resume=False):
     
     
     # Load datasets
-    train_dataset = DiffusionDataset(file_path=args.train_file_path, mode="train", steps=args.steps)
-    val_dataset = DiffusionDataset(file_path=args.val_file_path, mode="test", steps=args.steps)
+    train_dataset = DiffusionDataset(file_path=args.train_file_path, mode="train", steps=args.steps, schedule=args.schedule)
+    val_dataset = DiffusionDataset(file_path=args.val_file_path, mode="test", steps=args.steps, schedule=args.schedule)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=args.shuffle)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    model = UNET(image_channels=args.img_ch,
-                 time_dim=args.time_dim).to(args.device)
+    model = UNET_Cifar10(image_channels=args.img_ch,
+                 time_dim=args.time_dim,
+                 channels=[64, 128, 256],
+                 attn_bool=[True, True],
+                 n=2
+                 ).to(args.device)
 
     criterion = nn.MSELoss()
     optimizer = AdamW(params=model.parameters(),lr=args.learning_rate, betas=(args.beta1,args.beta2), eps=args.eps)
@@ -176,20 +180,20 @@ def train(args, config=None, resume=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--train_file_path", type=str, default="mnist_data.pkl")
-    parser.add_argument("--val_file_path", type=str, default="mnist_data.pkl")
+    parser.add_argument("--train_file_path", type=str, default="cifar10_data.pkl")
+    parser.add_argument("--val_file_path", type=str, default="cifar10_data.pkl")
     parser.add_argument("--schedule", type=str, choices=["linear","cosine"])
 
     parser.add_argument("--steps", type=int, default=1000)
 
-    parser.add_argument("--img_ch", type=int, default=1)
-    parser.add_argument("--time_dim", type=int, default=128)
+    parser.add_argument("--img_ch", type=int, default=3)
+    parser.add_argument("--time_dim", type=int, default=256)
 
     parser.add_argument("--learning_rate", type=float, default=2e-4)
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=600)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--shuffle", type=bool, default=True)
-    parser.add_argument("--save_every_n_epochs", type=int, default=75)
+    parser.add_argument("--save_every_n_epochs", type=int, default=150)
     parser.add_argument("--save_every_n_iteration_percentage", type=int, default=110)
     parser.add_argument("--validation_every_n_iteration_percentage", type=int, default=110)
     parser.add_argument("--validate_every_epoch", type=int, default=25)    
@@ -197,11 +201,11 @@ if __name__ == "__main__":
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.98)
     parser.add_argument("--eps", type=float, default=1e-9)
-    parser.add_argument("--weights_dir", type=str, default="weights_5")
+    parser.add_argument("--weights_dir", type=str, default="cifar_1")
     parser.add_argument("--log_file", type=str, default="train.log")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
 
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     args = parser.parse_args()
 

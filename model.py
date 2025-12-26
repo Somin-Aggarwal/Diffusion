@@ -2,28 +2,36 @@ import torch
 import torch.nn as nn
 from einops import repeat
 
-class SelfAttention(nn.Module):
+class SelfAttentionDiff(nn.Module):
     def __init__(self, in_ch, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.in_ch = in_ch
 
         self.q = nn.Conv2d(in_ch, in_ch, kernel_size=1)
         self.k = nn.Conv2d(in_ch, in_ch, kernel_size=1)
         self.v = nn.Conv2d(in_ch, in_ch, kernel_size=1)
+        
+        self.proj_out = nn.Conv2d(in_ch, in_ch, kernel_size=1)
 
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
     def forward(self, x):
         
         # softmax(QK^T/sqrt(d_k))V
-        batch_size, channels, height, width = x.shape
+        b, c, h, w = x.shape
 
-        q = torch.reshape(self.q(x),shape=(batch_size, channels, height*width)) # (b,edim,h*w)
-        k = torch.reshape(self.k(x),shape=(batch_size, channels, height*width))
-        v = torch.reshape(self.v(x),shape=(batch_size, channels, height*width))
-
-        attn_weights = torch.bmm(q.permute(0,2,1), k) / (channels ** 0.5)  # (b,h*w,h*w)
+        q = self.q(x).view(b, c, -1) ##
+        k = self.k(x).view(b, c, -1) # (b,c,h*w)
+        v = self.v(x).view(b, c, -1) ##
+        
+        attn_weights = torch.bmm(q.permute(0,2,1), k) / (c ** 0.5)  # (b,h*w,h*w)
         attn_weights = torch.softmax(attn_weights, dim=-1)
-        attn_output = torch.bmm(v, attn_weights.permute(0,2,1))  # (b,edim,h*w)
-        attn_output = torch.reshape(attn_output, shape=(batch_size, channels, height, width))
-        return attn_output
+        out = torch.bmm(v,attn_weights.permute(0,2,1))  # (b,h*w,edim)
+        
+        out = out.view(b, c, h, w) 
+        out = self.proj_out(out)
+               
+        return x + self.gamma * out
     
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, tdim=None):
@@ -94,7 +102,7 @@ class UNET(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
         self.num_classes = 10
-
+        
     def forward(self, x, t):
         
         t = t.view(-1, 1).float()                  
@@ -128,81 +136,108 @@ class UNET(nn.Module):
         
         return output
 
-class UNET_old(nn.Module):
-    def __init__(self, *args, **kwargs):
+class UNET_Cifar10(nn.Module):
+    def __init__(self, image_channels:int, channels:list, attn_bool:list, n:int, time_dim:int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
+        '''
+        n : Number of resblocks per resolution
+        '''
+        
+        assert len(attn_bool) == len(channels) - 1
+        self.image_channels = image_channels
+        
+        self.proj_in = nn.Conv2d(in_channels=image_channels, out_channels=channels[0], kernel_size=1)
         self.maxpool = nn.MaxPool2d(kernel_size=2)
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(in_channels=8, out_channels=8, kernel_size=3, padding=1)
-    
-        self.conv3 = nn.Conv2d(in_channels=8, out_channels=32, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
         
-        self.conv5 = nn.Conv2d(in_channels=32, out_channels=128, kernel_size=3, padding=1)
-        self.conv6 = nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1)
+        # if you use nn.module list then it send the layers and tensors to device 
+        # but if you use a normal list it will not detect the layers
         
-        self.neck1 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, padding=1)
-        self.neck2 = nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, padding=1)
+        self.encoder_blocks = nn.ModuleList()
+        for i in range(len(channels)-1):
+            block = nn.ModuleList()
+            block.append(ResBlock(in_channels=channels[i],out_channels=channels[i+1], tdim=time_dim))
+            for j in range(n-1):
+                block.append(ResBlock(in_channels=channels[i+1],out_channels=channels[i+1], tdim=time_dim))
+            if attn_bool[i]:
+                block.append(SelfAttentionDiff(in_ch=channels[i+1]))
+            self.encoder_blocks.append(block)
+        
+        self.neck1 = ResBlock(in_channels=channels[-1], out_channels=channels[-1], tdim=time_dim)  
+        self.attn_neck = SelfAttentionDiff(in_ch=channels[-1])
+        self.neck2 = ResBlock(in_channels=channels[-1], out_channels=channels[-1], tdim=time_dim)
 
-        self.TransConv1 = nn.ConvTranspose2d(in_channels=128, out_channels=128, kernel_size=2, stride=2)
-        self.conv7 = nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, padding=1)
-        self.conv8 = nn.Conv2d(in_channels=128, out_channels=32, kernel_size=3,padding=1)
+        self.decoder_blocks = nn.ModuleList()
+        for i in range(len(channels)-1,0,-1):
+            block = nn.ModuleList()
+            block.append(nn.ConvTranspose2d(in_channels=channels[i],out_channels=channels[i], kernel_size=2, stride=2))
+            block.append(ResBlock(in_channels=2*channels[i],out_channels=channels[i-1],tdim=time_dim))
+            for j in range(n-1):
+                block.append(ResBlock(in_channels=channels[i-1],out_channels=channels[i-1],tdim=time_dim))
+            if attn_bool[i-1]:
+                block.append(SelfAttentionDiff(in_ch=channels[i-1]))
+            self.decoder_blocks.append(block)
+                
+        self.proj_out = nn.Conv2d(in_channels=channels[0], out_channels=image_channels, kernel_size=1) 
         
-        self.TransConv2 = nn.ConvTranspose2d(in_channels=32, out_channels=32, kernel_size=2, stride=2)
-        self.conv9 = nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, padding=1)
-        self.conv10 = nn.Conv2d(in_channels=32, out_channels=8, kernel_size=3,padding=1)
-        
-        self.TransConv3 = nn.ConvTranspose2d(in_channels=8, out_channels=8, kernel_size=2, stride=2)
-        self.conv11 = nn.Conv2d(in_channels=16, out_channels=8, kernel_size=3, padding=1)
-        self.conv12 = nn.Conv2d(in_channels=8, out_channels=1, kernel_size=3,padding=1)
-
+        self.tdim = time_dim
         self.time_mlp = nn.Sequential(
-            nn.Linear(1, 128),
+            nn.Linear(1, time_dim),
             nn.ReLU(),
-            nn.Linear(128, 128)
+            nn.Linear(time_dim, time_dim)
         )
         
+        self.num_classes = 10
 
     def forward(self, x, t):
         
-        # Encoder
-        features1 = self.conv2(self.conv1(x))
-        features2 = self.conv4(self.conv3(self.maxpool(features1)))
-        features3 = self.conv6(self.conv5(self.maxpool(features2)))
-        
-        # Neck
-        final_features = self.neck2(self.neck1(self.maxpool(features3)))
-        
         t = t.view(-1, 1).float()                  
-        t_emb = self.time_mlp(t)                   
+        t_emb = self.time_mlp(t)       
         
-        t_emb = t_emb[:, :, None, None]                   
-        final_features = final_features + t_emb    
+        out = self.proj_in(x)
         
-        output = self.TransConv1(final_features)
-        output = torch.concatenate([output, features3], dim=1)
-        output = self.conv8(self.conv7(output))
+        features = []
+        for block in self.encoder_blocks:
+            for layer in block:
+                if isinstance(layer, ResBlock):
+                    out = layer(out, t_emb)
+                else:
+                    out = layer(out)
+            features.append(out)
+            out = self.maxpool(out)
         
-        output = self.TransConv2(output)
-        output = torch.concatenate([output, features2], dim=1)
-        output = self.conv10(self.conv9(output))
+        out = self.neck1(out,t_emb)
+        out = self.attn_neck(out)
+        out = self.neck2(out,t_emb)
         
-        output = self.TransConv3(output)
-        output = torch.concatenate([output, features1], dim=1)
-        output = self.conv12(self.conv11(output))
-        
-        return output
+        n_ft = len(features) 
+                
+        for i,block in enumerate(self.decoder_blocks):
+            out = block[0](out)
+            out = torch.concatenate((out,features[n_ft - 1 - i]),dim=1)
+            for layer in block[1:]:
+                if isinstance(layer, ResBlock):
+                    out = layer(out, t_emb)
+                else:
+                    out = layer(out)
 
-      
+        out = self.proj_out(out)
+        
+        return out
+     
 if __name__=="__main__":
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = UNET(image_channels=1,time_dim=128).to(device)
-    dummy_input = torch.randn(size=(1,1,32,32),device=device)
+    model = UNET_Cifar10(
+        image_channels=3,         # RGB images
+        channels=[64, 128, 256],  # Base width 64. Bottleneck will be at 8x8.
+        attn_bool=[True, True],   # Attention at 16x16 and 8x8 resolutions.
+        n=2,                      # 2 ResBlocks per level (Industry Standard)
+        time_dim=256              # Typically 4x the base channel size (4 * 64)
+    ).to(device)
+    dummy_input = torch.randn(size=(1,3,32,32),device=device)
     time = torch.randn(size=(1,1),device=device)
-    y = torch.tensor([0,],device=device)
-    
+       
     output = model(dummy_input, time)
     print(output.shape)
     
@@ -210,4 +245,3 @@ if __name__=="__main__":
     for params in model.parameters():
         param_count += params.numel()  
     print(param_count)    
-    # print(model)
