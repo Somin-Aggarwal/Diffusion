@@ -2,20 +2,97 @@ import torch
 import torch.nn as nn
 from einops import repeat
 import math
+from torch.nn import init
 
-class SinusoidalPositionEmbeddings(nn.Module):
-    def __init__(self, dim):
+class TimeEmbeddings(nn.Module):
+    def __init__(self, steps, d_model, time_dim):
         super().__init__()
-        self.dim = dim
+        
+        assert time_dim % 2 == 0
+        '''
+        [pos  * [1/10000^index0/d_model , 1/10000^index1/d_model, 1/10000^index2/d_model]
+         pos,
+         pos]
+         
+        [ pos/10000^index0/d_model , pos/10000^index1/d_model, pos/10000^index2/d_model]
+        [ pos/10000^index0/d_model , pos/10000^index1/d_model, pos/10000^index2/d_model]
+        [ pos/10000^index0/d_model , pos/10000^index1/d_model, pos/10000^index2/d_model]
+        
+        now sin and cos the above matrix
+        Stack and reshape
 
-    def forward(self, time):
-        device = time.device
-        half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
+        '''
+        
+        pos = torch.arange(0,steps)
+        
+        emb = ( torch.arange(0,d_model,2) / d_model ) * math.log(10000)
+        emb = torch.exp(-emb)
+        emb = pos[:,None] * emb[None,:]
+        
+        emb = torch.stack([torch.sin(emb),torch.cos(emb)], dim=-1)
+        emb = emb.view(steps, d_model)
+        
+        self.register_buffer("emb", emb)
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(d_model,time_dim),
+            nn.SiLU(),
+            nn.Linear(time_dim,time_dim)
+        )
+        self.initialize()
+    
+    def initialize(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                init.xavier_uniform_(module.weight)
+                init.zeros_(module.bias)
+    
+    def forward(self, t):
+        if t.dim() == 2:
+            t = t.squeeze(1)
+        emb = self.emb[t]           # (B, d_model)
+        return self.time_mlp(emb)   # (B, time_dim)
+    
+class Downsample(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 3, 2, 1)
+        self.initialize()
+        
+    def initialize(self):
+        init.xavier_uniform_(self.conv.weight)
+        init.zeros_(self.conv.bias)
+
+    def forward(self, x, emb):
+        return self.conv(x)
+
+'''
+Xavier uniform initialization is used in deep NN
+such that the weights are not too small or big and 
+depend on the connections 
+ U(-a,+a)
+ a = gain * srqt(6/(fan_in+fan_out))
+fan_in: The number of input connections to the layer (e.g., input channels × kernel size).
+fan_out: The number of output connections.
+The Goal: It attempts to keep the variance of the activations the same across every layer.
+'''
+
+class Upsample(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
+        self.initialize()
+        
+    def initialize(self):
+        init.xavier_uniform_(self.conv.weight)
+        init.zeros_(self.conv.bias)
+
+    def forward(self, x, emb):
+        b,c,h,w = x.shape
+        x = nn.functional.interpolate(x,size=(2*h,2*w),mode="nearest")
+        x = self.conv(x)
+        return x
+
 class SelfAttentionDiff(nn.Module):
     def __init__(self, in_ch, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -23,15 +100,21 @@ class SelfAttentionDiff(nn.Module):
 
         self.group_norm = nn.GroupNorm(num_groups=min(in_ch,32), num_channels=in_ch)
 
-        
-        self.q = nn.Conv2d(in_ch, in_ch, kernel_size=1)
-        self.k = nn.Conv2d(in_ch, in_ch, kernel_size=1)
-        self.v = nn.Conv2d(in_ch, in_ch, kernel_size=1)
+        self.proj_q = nn.Conv2d(in_ch, in_ch, kernel_size=1)
+        self.proj_k = nn.Conv2d(in_ch, in_ch, kernel_size=1)
+        self.proj_v = nn.Conv2d(in_ch, in_ch, kernel_size=1)
         
         self.proj_out = nn.Conv2d(in_ch, in_ch, kernel_size=1)
 
-        self.gamma = nn.Parameter(torch.zeros(1))
-        
+        self.gamma = nn.Parameter(torch.ones(1))
+
+        self.initialize()
+
+    def initialize(self):
+        for module in [self.proj_q, self.proj_k, self.proj_v, self.proj_out]:
+            init.xavier_uniform_(module.weight)
+            init.zeros_(module.bias)
+     
     def forward(self, x):
         
         # softmax(QK^T/sqrt(d_k))V
@@ -39,9 +122,9 @@ class SelfAttentionDiff(nn.Module):
         
         x_dash = self.group_norm(x)
 
-        q = self.q(x_dash).view(b, c, -1) ##
-        k = self.k(x_dash).view(b, c, -1) # (b,c,h*w)
-        v = self.v(x_dash).view(b, c, -1) ##
+        q = self.proj_q(x_dash).view(b, c, -1) ##
+        k = self.proj_k(x_dash).view(b, c, -1) # (b,c,h*w)
+        v = self.proj_v(x_dash).view(b, c, -1) ##
         
         attn_weights = torch.bmm(q.permute(0,2,1), k) / (c ** 0.5)  # (b,h*w,h*w)
         attn_weights = torch.softmax(attn_weights, dim=-1)
@@ -51,264 +134,189 @@ class SelfAttentionDiff(nn.Module):
         out = self.proj_out(out)
                
         return x + self.gamma * out
-    
-class ResBlock_2(nn.Module):
-    def __init__(self, in_channels, out_channels, tdim=None):
-        super(ResBlock_2, self).__init__()
+
+'''
+Pre Norm 
+norm -> activation -> conv
+'''
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, attn, tdim):
+        super(ResBlock, self).__init__()
+        
         self.gn1 = nn.GroupNorm(num_groups=min(in_channels,32), num_channels=in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         
         self.gn2 = nn.GroupNorm(num_groups=min(out_channels,32), num_channels=out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        
         if in_channels != out_channels:
             self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
             self.shortcut = nn.Identity()
             
+        if attn:
+            self.attn = SelfAttentionDiff(in_ch=out_channels)
+        else:
+            self.attn = nn.Identity()
+        
         self.silu = nn.SiLU()
         
         self.tdim = tdim
-        if tdim is not None:
-            self.time_linear = nn.Linear(tdim,out_channels)
-        
-    def forward(self, x, t):
-        
-        identity = self.shortcut(x)
-        
+        self.emb_linear = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(tdim,out_channels)
+        )
+    
+        self.initialize()
+
+    def initialize(self):
+        for module in self.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                init.xavier_uniform_(module.weight)
+                init.zeros_(module.bias)
+    
+    def forward(self, x, emb):
+                
         out = self.gn1(x)
         out = self.silu(out)
         out = self.conv1(out)
         
-        if self.tdim is not None:
-            t_emb = self.time_linear(t)
-            t_emb = repeat(t_emb, 'b e -> b e h w', h=out.shape[2], w=out.shape[3])
-            out = out + t_emb
+        t_emb = self.emb_linear(emb)
+        out = out + t_emb[:,:,None,None]
 
         out = self.gn2(out)
         out = self.silu(out)
         out = self.conv2(out)
 
-        out = out + identity
-        return out
-    
-class ResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, tdim=None):
-        super(ResBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.gn1 = nn.GroupNorm(num_groups=min(out_channels,32), num_channels=out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.gn2 = nn.GroupNorm(num_groups=min(out_channels,32), num_channels=out_channels)
-        if in_channels != out_channels:
-            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        else:
-            self.shortcut = nn.Identity()
-        self.relu = nn.ReLU()
-        
-        self.tdim = tdim
-        if tdim is not None:
-            self.time_linear = nn.Linear(tdim,out_channels)
-        
-    def forward(self, x, t):
-        
-        identity = self.shortcut(x)
-        out = self.relu(self.gn1(self.conv1(x)))
-        if self.tdim is not None:
-            t_emb = self.time_linear(t)
-            t_emb = repeat(t_emb, 'b e -> b e h w', h=out.shape[2], w=out.shape[3])
-            out = out + t_emb
-        out = self.gn2(self.conv2(out))
-        out = out + identity
-        out = self.relu(out)
+        out = out + self.shortcut(x)
+        out = self.attn(out)
         return out
 
-class UNET(nn.Module):
-    def __init__(self, image_channels, time_dim, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-        self.image_channels = image_channels
-        
-        self.block1 = ResBlock(in_channels=image_channels, out_channels=8, tdim=time_dim)
-        self.maxpool1 = nn.MaxPool2d(kernel_size=2)
-
-        self.block2 = ResBlock(in_channels=8, out_channels=32, tdim=time_dim)
-        self.maxpool2 = nn.MaxPool2d(kernel_size=2)
-
-        self.block3 = ResBlock(in_channels=32, out_channels=128, tdim=time_dim)
-        self.maxpool3 = nn.MaxPool2d(kernel_size=2)   
-
-        self.neck1 = ResBlock(in_channels=128, out_channels=256, tdim=time_dim)  
-        self.neck2 = ResBlock(in_channels=256, out_channels=128, tdim=time_dim)
-
-        self.TransConv1 = nn.ConvTranspose2d(in_channels=128, out_channels=128, kernel_size=2, stride=2)
-        self.Upblock1 = nn.Sequential(ResBlock(in_channels=256, out_channels=128, tdim=time_dim),
-                                       ResBlock(in_channels=128, out_channels=32, tdim=time_dim)
-                                       )
-        
-        self.TransConv2 = nn.ConvTranspose2d(in_channels=32, out_channels=32, kernel_size=2, stride=2)
-        self.Upblock2 = nn.Sequential(ResBlock(in_channels=64, out_channels=32, tdim=time_dim),
-                                       ResBlock(in_channels=32, out_channels=8, tdim=time_dim)
-                                       )
-        
-        self.TransConv3 = nn.ConvTranspose2d(in_channels=8, out_channels=8, kernel_size=2, stride=2)
-        self.Upblock3 = nn.Sequential(ResBlock(in_channels=16, out_channels=16, tdim=time_dim))
-        self.final_conv = nn.Conv2d(in_channels=16, out_channels=image_channels, kernel_size=1) 
-        
-        self.tdim = time_dim
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, time_dim),
-            nn.ReLU(),
-            nn.Linear(time_dim, time_dim)
-        )
-        self.num_classes = 10
-        
-    def forward(self, x, t):
-        
-        t = t.view(-1, 1).float()                  
-        t_emb = self.time_mlp(t)       
-                    
-        # Encoder
-        features1 = self.block1(x,t_emb) # 32x32x8
-        features2 = self.block2(self.maxpool1(features1), t_emb) # 16x16x32
-        features3 = self.block3(self.maxpool2(features2), t_emb) # 8x8x128
-        
-        # Neck
-        final_features = self.neck2(self.neck1(self.maxpool3(features3), t_emb),t_emb)
-                
-        final_features = final_features + t_emb[:, :, None, None]    
-        
-        output = self.TransConv1(final_features)
-        output = torch.concatenate([output, features3], dim=1)
-        for block in self.Upblock1:
-            output = block(output,t_emb)
-        
-        output = self.TransConv2(output)
-        output = torch.concatenate([output, features2], dim=1)
-        for block in self.Upblock2:
-            output = block(output,t_emb)
-        
-        output = self.TransConv3(output)
-        output = torch.concatenate([output, features1], dim=1)
-        for block in self.Upblock3:
-            output = block(output,t_emb)
-        output = self.final_conv(output)
-        
-        return output
-
-class UNET_Cifar10(nn.Module):
-    def __init__(self, image_channels:int, channels:list, attn_bool:list, n:int, time_dim:int, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-        '''
-        n : Number of resblocks per resolution
-        '''
-        
-        assert len(attn_bool) == len(channels) - 1
-        self.image_channels = image_channels
-        
-        self.proj_in = nn.Conv2d(in_channels=image_channels, out_channels=channels[0], kernel_size=1)
-        self.maxpool = nn.MaxPool2d(kernel_size=2)
-        
-        # if you use nn.module list then it send the layers and tensors to device 
-        # but if you use a normal list it will not detect the layers
-        
-        self.encoder_blocks = nn.ModuleList()
-        for i in range(len(channels)-1):
-            block = nn.ModuleList()
-            block.append(ResBlock_2(in_channels=channels[i],out_channels=channels[i+1], tdim=time_dim))
-            for j in range(n-1):
-                block.append(ResBlock_2(in_channels=channels[i+1],out_channels=channels[i+1], tdim=time_dim))
-            if attn_bool[i]:
-                block.append(SelfAttentionDiff(in_ch=channels[i+1]))
-            block.append(nn.Conv2d(in_channels=channels[i+1],out_channels=channels[i+1],kernel_size=3,stride=2,padding=1))
-            self.encoder_blocks.append(block)
-        
-        self.neck1 = ResBlock_2(in_channels=channels[-1], out_channels=channels[-1], tdim=time_dim)  
-        self.attn_neck = SelfAttentionDiff(in_ch=channels[-1])
-        self.neck2 = ResBlock_2(in_channels=channels[-1], out_channels=channels[-1], tdim=time_dim)
-
-        self.decoder_blocks = nn.ModuleList()
-        for i in range(len(channels)-1,0,-1):
-            block = nn.ModuleList()
-            block.append(nn.Sequential(
-                    nn.Upsample(scale_factor=2, mode='nearest'),
-                    nn.Conv2d(channels[i], channels[i], kernel_size=3, padding=1))
-            )
-            block.append(ResBlock_2(in_channels=2*channels[i],out_channels=channels[i-1],tdim=time_dim))
-            for j in range(n-1):
-                block.append(ResBlock_2(in_channels=channels[i-1],out_channels=channels[i-1],tdim=time_dim))
-            if attn_bool[i-1]:
-                block.append(SelfAttentionDiff(in_ch=channels[i-1]))
-            self.decoder_blocks.append(block)
-                
-        
-        self.tdim = time_dim
-        self.get_time_emb = SinusoidalPositionEmbeddings(time_dim)
-        self.time_mlp = nn.Sequential(
-            nn.Linear(time_dim, time_dim*4),
+class ClassEmbeddings(nn.Module):
+    def __init__(self, n_classes, edim):
+        super().__init__()
+        self.embeddings = nn.Embedding(num_embeddings=n_classes,
+                                       embedding_dim=edim)
+        self.class_mlp = nn.Sequential(
+            nn.Linear(edim,edim),
             nn.SiLU(),
-            nn.Linear(time_dim*4, time_dim)
+            nn.Linear(edim,edim)
         )
+    
+    def forward(self,index):
+        embedding = self.embeddings(index)
+        return self.class_mlp(embedding)
         
-        self.final_norm = nn.GroupNorm(num_groups=min(32,channels[0]), num_channels=channels[0])
-        self.final_act = nn.SiLU()
-        self.proj_out = nn.Conv2d(channels[0], image_channels, kernel_size=3, padding=1)
 
-    def forward(self, x, t):
+class UNet(nn.Module):
+    def __init__(self, img_ch, base_ch, ch_mul, attn, n_resblocks, steps, tdim, n_classes):
+        super().__init__()
         
-        t_emb = self.get_time_emb(t)
-        t_emb = t_emb.squeeze(0)
-        t_emb = self.time_mlp(t_emb)    
+        self.time_embedding = TimeEmbeddings(steps, tdim, tdim)
         
-        out = self.proj_in(x)
+        self.class_embeddings = ClassEmbeddings(n_classes=n_classes+1,
+                                                edim=tdim)
+        self.n_classes = n_classes
         
-        features = []
-        for block in self.encoder_blocks:
-            for layer in block[:-1]:
-                if isinstance(layer, ResBlock_2):
-                    out = layer(out, t_emb)
-                else:
-                    out = layer(out)
-            features.append(out)
-            out = block[-1](out)
+        self.initial_conv = nn.Conv2d(img_ch, base_ch, 3 ,1, 1)
+        
+        channels_list = [base_ch]
+        current_ch = base_ch
+        self.encoder_blocks = nn.ModuleList()
+        for i,mul in enumerate(ch_mul):
+            out_ch = base_ch * mul
+            for _ in range(n_resblocks):
+                self.encoder_blocks.append(
+                    ResBlock(current_ch,out_ch,attn=(i in attn),tdim=tdim)
+                    )
+                current_ch = out_ch
+                channels_list.append(out_ch)
+            if i != len(ch_mul) - 1:
+                self.encoder_blocks.append(
+                    Downsample(current_ch,out_ch)
+                )
+                current_ch = out_ch
+                channels_list.append(out_ch)
+        
+        self.middleblocks = nn.ModuleList([
+            ResBlock(current_ch, current_ch, tdim=tdim, attn=True),
+            ResBlock(current_ch, current_ch, tdim=tdim, attn=False),
+        ])
+        
+        self.decoder_blocks = nn.ModuleList()
+        for i,mul in reversed(list(enumerate(ch_mul))):
+            out_ch = base_ch * mul
+            for _ in range(n_resblocks + 1):
+                self.decoder_blocks.append(
+                    ResBlock(channels_list.pop() + current_ch,out_ch,attn=(i in attn),tdim=tdim)
+                )
+                current_ch = out_ch
+            if i != 0:
+                self.decoder_blocks.append(
+                    Upsample(current_ch,out_ch)
+                )
+                current_ch = out_ch
+        
+        self.proj_out = nn.Sequential(
+            nn.GroupNorm(num_groups=min(current_ch,32),num_channels=current_ch),
+            nn.SiLU(),
+            nn.Conv2d(current_ch, img_ch, 3, 1, 1)
+        )
+        self.initialize()
+        
+    def initialize(self):
+        init.xavier_uniform_(self.initial_conv.weight)
+        init.zeros_(self.initial_conv.bias)
+        init.xavier_uniform_(self.proj_out[-1].weight, gain=1.5)
+        init.zeros_(self.proj_out[-1].bias)
+    
+    def forward(self, x, t, label_idx):
+        
+        temb = self.time_embedding(t)
+        class_emb = self.class_embeddings(label_idx) 
+        
+        global_emb = temb + class_emb
+        
+        x = self.initial_conv(x)
+        
+        features = [x]
+        for layer in self.encoder_blocks:
+            x = layer(x,global_emb)
+            features.append(x)
+        
+        for layer in self.middleblocks:
+            x = layer(x, global_emb)
 
-        out = self.neck1(out,t_emb)
-        out = self.attn_neck(out)
-        out = self.neck2(out,t_emb)
+        for layer in self.decoder_blocks:
+            if isinstance(layer,ResBlock):
+                x = torch.concat([x,features.pop()],dim=1)
+            x = layer(x,global_emb)
         
-        n_ft = len(features) 
-                
-        for i,block in enumerate(self.decoder_blocks):
-            out = block[0](out)
-            out = torch.concatenate((out,features[n_ft - 1 - i]),dim=1)
-            for layer in block[1:]:
-                if isinstance(layer, ResBlock_2):
-                    out = layer(out, t_emb)
-                else:
-                    out = layer(out)
-
-        out = self.final_norm(out)
-        out = self.final_act(out)
-        out = self.proj_out(out)
-        
-        return out
-     
+        x = self.proj_out(x)
+        return x
+                 
+    
 if __name__=="__main__":
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = UNET_Cifar10(
-        image_channels=3,         # RGB images
-        channels=[64, 128, 256, 512],  # Base width 64. Bottleneck will be at 8x8.
-        attn_bool=[False, True, True],   # Attention at 16x16 and 8x8 resolutions.
-        n=2,                      # 2 ResBlocks per level (Industry Standard)
-        time_dim=256              # Typically 4x the base channel size (4 * 64)
-    ).to(device)
-    dummy_input = torch.randn(size=(2,3,32,32),device=device)
-    time = torch.randn(size=(1,1),device=device)
-       
-    output = model(dummy_input, time)
-    print(output.shape)
+    model = UNet(img_ch=1,
+                 base_ch=32,
+                 ch_mul=[1,2,2,4],
+                 attn=[],
+                 n_resblocks=1,
+                 steps=1000,
+                 tdim=256,
+                 n_classes=10)
+
+    batch_size = 8
+    x = torch.randn(batch_size, 1, 32, 32)
+    t = torch.randint(1000, (batch_size, ))
+    label_idx = torch.randint(10, (batch_size, ))
+    y = model(x, t, label_idx)
+    print(y.shape)
+    # print(model)
     
     param_count = 0
     for params in model.parameters():
-        param_count += params.numel()  
-    print(param_count)    
+        param_count += params.numel()
+    print(f"Parameters : {param_count}")
