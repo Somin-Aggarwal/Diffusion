@@ -97,10 +97,9 @@ class DiffusionDataset(Dataset):
         self.beta_t = data["betas"]
         self.alpha_t = data["alphas"]
         
-        self.alpha_t_dash = data["alphas_cumprod"]
         
-        self.sqrt_alpha_t_dash = torch.sqrt(self.alpha_t_dash)
-        self.sqrt_1_minus_alpha_t_dash = torch.sqrt(1 - self.alpha_t_dash)
+        self.sqrt_alpha_t_dash = data['sqrt_alphas_cumprod']
+        self.sqrt_1_minus_alpha_t_dash = data['sqrt_one_minus_alphas_cumprod']
         
         self.val_multiple = 20
         self.bin_size = self.steps // self.val_multiple
@@ -160,8 +159,16 @@ def display_image(noisy_image, noise, time):
 
 if __name__=="__main__":
     
-    diff_dataset = DiffusionDataset(file_path="cifar10_data.pkl", mode="train", steps=1000, schedule="cosine")
+    diff_dataset = DiffusionDataset(file_path="cifar10_data.pkl", mode="test", steps=1000, schedule="cosine")
     diff_dataloader = DataLoader(diff_dataset, batch_size=8, shuffle=True, num_workers=4)
+    
+    data = cosine_schedule(T=1000)
+    means = data['sqrt_alphas_cumprod']
+    variances = data['sqrt_one_minus_alphas_cumprod']
+    
+    plt.plot(np.arange(1000),means)
+    plt.plot(np.arange(1000),variances)
+    plt.show()
     
     print(f"Length of DataLoader : {len(diff_dataloader)}")
     
