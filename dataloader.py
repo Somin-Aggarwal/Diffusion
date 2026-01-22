@@ -79,11 +79,15 @@ class DiffusionDataset(Dataset):
         self.transform  = transforms.Compose([
             transforms.ToTensor(), # Image is scaled between 0 and 1
             transforms.Resize(size=(32,32), antialias=False),
-        ])
+        ]) # Input Range : [-1,+1]
         
         self.x = data[f"x_{self.mode}"]
         if self.x.ndim == 3:
             self.x = np.expand_dims(self.x,axis=-1)
+            self.transform.transforms.append(transforms.Normalize((0.5),(0.5)))
+        else:
+            self.transform.transforms.append(transforms.Normalize((0.5,0.5,0.5),(0.5,0.5,0.5))) # ( image - 0.5 ) / 0.5
+
         self.y = data[f"y_{self.mode}"]        
         del data
         
@@ -97,21 +101,18 @@ class DiffusionDataset(Dataset):
         self.beta_t = data["betas"]
         self.alpha_t = data["alphas"]
         
-        
         self.sqrt_alpha_t_dash = data['sqrt_alphas_cumprod']
         self.sqrt_1_minus_alpha_t_dash = data['sqrt_one_minus_alphas_cumprod']
         
         self.val_multiple = 20
         self.bin_size = self.steps // self.val_multiple
         
-    def convert(self, image_tensor, t):
-        # image tensor ranges from [0,1] because of ToTensor() transformation
-        image_tensor = 2*image_tensor - 1 # Scalling image to [-1,+1]
+    def forward_process(self, image_tensor, t):
         noise = torch.randn_like(image_tensor)
         noisy_image = self.sqrt_alpha_t_dash[t] * image_tensor + self.sqrt_1_minus_alpha_t_dash[t] * noise
         return noisy_image, noise
 
-    def __len__(self):   
+    def __len__(self):
         if self.mode == "test":
             return self.x.shape[0]*self.val_multiple
         return self.x.shape[0]
@@ -126,8 +127,8 @@ class DiffusionDataset(Dataset):
         else:
             t = int(np.random.uniform(low=0,high=self.steps))
             
-        noisy_image, noise = self.convert(self.transform(self.x[idx]),t)
-        return noisy_image, noise, t + 1, self.y[idx]
+        noisy_image, noise = self.forward_process( self.transform(self.x[idx]) ,t )
+        return noisy_image, noise, t, int(self.y[idx])
 
 def display_image(noisy_image, noise, time):
     batch = noisy_image.shape[0]
@@ -159,17 +160,10 @@ def display_image(noisy_image, noise, time):
 
 if __name__=="__main__":
     
-    diff_dataset = DiffusionDataset(file_path="cifar10_data.pkl", mode="test", steps=1000, schedule="cosine")
+    diff_dataset = DiffusionDataset(file_path="mnist_data.pkl", mode="train", steps=1000, schedule="linear")
     diff_dataloader = DataLoader(diff_dataset, batch_size=8, shuffle=True, num_workers=4)
     
-    data = cosine_schedule(T=1000)
-    means = data['sqrt_alphas_cumprod']
-    variances = data['sqrt_one_minus_alphas_cumprod']
-    
-    plt.plot(np.arange(1000),means)
-    plt.plot(np.arange(1000),variances)
-    plt.show()
-    
+    data = cosine_schedule(T=1000)    
     print(f"Length of DataLoader : {len(diff_dataloader)}")
     
     for i,batch in tqdm(enumerate(diff_dataloader)):

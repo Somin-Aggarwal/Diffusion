@@ -1,225 +1,227 @@
 import torch
 import torch.nn as nn
-from torch.optim import Adam,AdamW
+from torch.optim import AdamW,lr_scheduler
 import os 
 from dataloader import DiffusionDataset
-from model import UNET, UNET_Cifar10
 from torch.utils.data import DataLoader
+from model import UNet
 import argparse
 from tqdm import tqdm
-import logging
 import torch.optim.lr_scheduler as lr_scheduler
-from argparse import Namespace
-import sys
-from my_utils import save_checkpoint
+from my_utils import save_checkpoint, label_converter
 import random
 import numpy as np
+import json 
 
-logger = logging.getLogger(__name__)
+def train(config):
+    os.makedirs(config["logging"]["weights_dir"], exist_ok=True)
+    log_path = f"{config['logging']['weights_dir']}/train_log.jsonl" 
+    with open(log_path,"w") as file:
+        json.dump(config,file,indent=4)
 
-def train(args, config=None, resume=False):
-    
-    os.makedirs(args.weights_dir, exist_ok=True)
+    seed = config["seed"]
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    logging.basicConfig(
-    filename=f"{args.weights_dir}/{args.log_file}",
-    filemode='a',  # Append mode; creates file if it doesn't exist
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)   
-    logger.info("\n\n\nSTARTED TRAINING\n")
-    print(vars(args))
-    logger.info(f"{vars(args)}")
-    
-    # Set random seed for reproducibility
-    torch.manual_seed(args.random_seed)
-    torch.cuda.manual_seed_all(args.random_seed)
-    random.seed(args.random_seed)
-    np.random.seed(args.random_seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    
-    
-    # Load datasets
-    train_dataset = DiffusionDataset(file_path=args.train_file_path, mode="train", steps=args.steps, schedule=args.schedule)
-    val_dataset = DiffusionDataset(file_path=args.val_file_path, mode="test", steps=args.steps, schedule=args.schedule)
+    # Dataset
+    train_dataset = DiffusionDataset(
+        file_path=config["train_file_path"],
+        mode="train",
+        steps=config["steps"],
+        schedule=config["schedule"],
+    )
+    val_dataset = DiffusionDataset(
+        file_path=config["val_file_path"],
+        mode="test",
+        steps=config["steps"],
+        schedule=config["schedule"],
+    )
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=args.shuffle)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["training"]["batch_size"],
+        shuffle=config["training"]["shuffle"],
+        num_workers=config["num_workers"],
+        pin_memory=config["device"].startswith("cuda"),
+        drop_last=True
+    )
 
-    model = UNET_Cifar10(image_channels=args.img_ch,
-                 time_dim=args.time_dim,
-                 channels=[64, 128, 256],
-                 attn_bool=[True, True],
-                 n=2
-                 ).to(args.device)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config["training"]["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+        pin_memory=config["device"].startswith("cuda"),
+    )
 
+    # Model
+    mcfg = config["model"]
+    model = UNet(
+        img_ch=mcfg['img_ch'],
+        base_ch=mcfg["base_ch"],
+        ch_mul=mcfg["ch_mul"],
+        attn=mcfg["attn"],
+        n_resblocks=mcfg["n_resblocks"],
+        tdim=mcfg["tdim"],
+        steps=config['steps'],
+        n_classes=config["n_classes"]
+    ).to(config["device"])
+
+    optimizer = AdamW(model.parameters(), lr=config["training"]["learning_rate"])
     criterion = nn.MSELoss()
-    optimizer = AdamW(params=model.parameters(),lr=args.learning_rate, betas=(args.beta1,args.beta2), eps=args.eps)
-    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=6)
+
+    epochs = config["training"]["epochs"]
+    warmup_epochs = min(config["training"]["warmup_epochs"], epochs - 1)
+
+    warmup_scheduler = lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-6, end_factor=1.0, total_iters=warmup_epochs
+    )
+
+    cosine_scheduler = lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs - warmup_epochs,
+        eta_min=config["training"]["eta_min"],
+    )
     
-    start_epoch = 0
-    skip_iteration = -1
-    if resume and os.path.exists(f"{args.weights_dir}/best_model.pt"):
-        best_val_loss = torch.load(f"{args.weights_dir}/best_model.pt")['loss']
-    else:
-        best_val_loss = 1e10
-    
-    # Resume from checkpoint
-    if resume and config is not None:
-        # Load saved states
-        start_epoch = config['epoch']
-        skip_iteration = config['iteration']
-        model.load_state_dict(config['model_state_dict'])
-        optimizer.load_state_dict(config['optimizer_state_dict'])
-        if 'scheduler_state_dict' in config:
-            scheduler.load_state_dict(config['scheduler_state_dict'])
-        print(f"Resuming from epoch {start_epoch}, iteration {skip_iteration}")
-        logging.info(f"Resumed: epoch {start_epoch}, iter {skip_iteration}, best_val_loss {best_val_loss}")
-    
-    epochs = args.epochs
-    total_batches = len(train_loader)
-    # if save_every_n_iteration_percentage = 5 then 100/5 = 20 files will be stored for every iteration
-    save_every = max(1, total_batches * args.save_every_n_iteration_percentage // 100)
-    validate_every = max(1, total_batches * args.validation_every_n_iteration_percentage // 100)
-    
-    print(f"Total batches: {total_batches}, save every {save_every}, validate every {validate_every}")
-    logging.info(f"Total batches: {total_batches}, save_every: {save_every}, validate_every: {validate_every}")
-    
-    for current_epoch in tqdm(range(start_epoch,epochs),desc="Epochs"):
-        
+    scheduler = lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
+    )
+
+    best_val_loss = float("inf")
+    null_idx = config["n_classes"] # idx
+
+    for epoch in tqdm(range(epochs), desc="Epochs"):
+        model.train()
         epoch_loss = 0.0
-        train_iterator = tqdm(train_loader, desc=f"Training Epoch {current_epoch+1}", leave=False)
         
-        for current_iteration, batch in enumerate(train_iterator):
-            # skip already processed iterations
-            if current_epoch == start_epoch and current_iteration <= skip_iteration:
-                continue
+        train_iterator = tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False)
+        for i, (noisy_image, actual_noise, time, labels) in enumerate(train_iterator):
+            noisy_image = noisy_image.to(config["device"])
+            actual_noise = actual_noise.to(config["device"])
+            time = time.to(config["device"])
+            labels = labels.to(config["device"])
 
-            noisy_image, actual_noise , time, label = batch
-
-            noisy_image = noisy_image.to(args.device)
-            actual_noise = actual_noise.to(args.device)
-            time = time.to(args.device)
-            label = label.to(args.device)
-
-            optimizer.zero_grad()
+            train_labels = label_converter(labels=labels,
+                                           null_idx=null_idx,
+                                           unconditional_percentage=config["uncond_per"],
+                                           batch_size=config["training"]["batch_size"],
+                                           device=config["device"])
             
-            predicted_noise = model(noisy_image, time)
-
-            loss = criterion(predicted_noise, actual_noise)   
-                        
+            
+            optimizer.zero_grad()
+            predicted_noise = model(noisy_image, time, train_labels)
+            loss = criterion(predicted_noise, actual_noise)
             loss.backward()
             optimizer.step()
-            
-            loss_value = loss.item() 
-            epoch_loss += loss_value
 
-            # Display iteration loss on tqdm bar
-            train_iterator.set_postfix(iter_loss=loss_value)
-            logger.info(f"Epoch : {current_epoch} | Iteration : {current_iteration} | Iteration Loss : {loss_value} | Running Epoch Loss : {epoch_loss}")
+            epoch_loss += loss.item()
             
-            # Save intermediate checkpoint
-            if (current_iteration + 1) % save_every == 0:
-                save_checkpoint(
-                    f"checkpoint_epoch{current_epoch}_iter{current_iteration}.pt",
-                    model.state_dict(), optimizer.state_dict(), scheduler.state_dict(),
-                    current_epoch, current_iteration, loss_value,
-                    args, args.weights_dir
-                )
-                prev_file = f"{args.weights_dir}/checkpoint_epoch{current_epoch-1}_iter{current_iteration}.pt"
-                if os.path.isfile(prev_file):
-                    os.remove(prev_file)
-            
-        # Validation Epoch
-        if (current_epoch + 1) % args.validate_every_epoch == 0 or current_epoch == epochs - 1:
+            current_lr = optimizer.param_groups[0]['lr']
+            train_iterator.set_postfix(loss=loss.item(), avg_loss=epoch_loss/(i+1), lr=current_lr)
+
+        info = {"Epoch":epoch+1,"Loss":epoch_loss/len(train_loader),"lr":current_lr}
+        
+        scheduler.step()
+
+        # Validation
+        if (epoch + 1) % config["logging"]["validate_every_epoch"] == 0 or epoch == epochs - 1:
             model.eval()
             val_loss = 0.0
-            for i, vbatch in tqdm(enumerate(val_loader),total=len(val_loader)):
-                noisy_image_v, actual_noise_v, time_v, label_v = vbatch
-                
-                noisy_image_v = noisy_image_v.to(args.device)
-                actual_noise_v = actual_noise_v.to(args.device)
-                time_v = time_v.to(args.device)
-                label_v = label_v.to(args.device)
+            with torch.no_grad():
+                for noisy_image, actual_noise, time, labels in val_loader:
+                    noisy_image = noisy_image.to(config["device"])
+                    actual_noise = actual_noise.to(config["device"])
+                    time = time.to(config["device"])
+                    labels = labels.to(config["device"])
 
-                with torch.no_grad():
-                    predicted_noise_v = model(noisy_image_v, time_v)
-                    l_v = criterion(predicted_noise_v, actual_noise_v)   
-                val_loss += l_v.item()
-            val_loss /= (i + 1)
-            print(f"Validation Loss: {val_loss}")
-            logging.info(f"Validation Loss {val_loss} at epoch {current_epoch}, iter {current_iteration}")
-            
-            scheduler.step(val_loss)
+                    pred = model(noisy_image, time, labels)
+                    val_loss += criterion(pred, actual_noise).item()
+
+            val_loss /= len(val_loader)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_checkpoint(
                     "best_model.pt",
-                    model.state_dict(), optimizer.state_dict(), scheduler.state_dict(),
-                    current_epoch, current_iteration, val_loss,
-                    args, args.weights_dir
+                    model.state_dict(),
+                    optimizer.state_dict(),
+                    scheduler.state_dict(),
+                    epoch,
+                    i,
+                    val_loss,
+                    config,
+                    config["logging"]["weights_dir"],
                 )
-                print(f"Saving model as BEST MODEL")
-            model.train()
-
-        # Epoch-end save
-        if (current_epoch + 1) % args.save_every_n_epochs == 0 or current_epoch == epochs -1 :
-            avg_loss = epoch_loss / (total_batches - skip_iteration if current_epoch == start_epoch else total_batches)
+                val_string = f"Val loss : {val_loss} | BEST MODEL"
+                print(val_string)
+            else:
+                val_string = f"Val loss : {val_loss}"
+                print(val_string)
+        
+            with open(log_path,"a") as file:
+                info["Val Loss"] = val_loss
+                file.write("\n"+json.dumps(info))
+        else:
+            with open(log_path,"a") as file:
+                file.write("\n"+json.dumps(info))
+       
+        # Epoch checkpoint
+        if (epoch + 1) % config["logging"]["save_every_n_epochs"] == 0:
             save_checkpoint(
-                f"epoch{current_epoch+1}_end.pt",
-                model.state_dict(), optimizer.state_dict(), scheduler.state_dict(),
-                current_epoch, current_iteration, avg_loss,
-                args, args.weights_dir
+                f"epoch{epoch+1}.pt",
+                model.state_dict(),
+                optimizer.state_dict(),
+                scheduler.state_dict(),
+                epoch,
+                i,
+                epoch_loss / len(train_loader),
+                config,
+                config["logging"]["weights_dir"],
             )
-            
-        # after first resume epoch, reset skip_iteration
-        skip_iteration = -1      
+           
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    config = {
+        "train_file_path": "mnist_data.pkl",
+        "val_file_path": "mnist_data.pkl",
+        "num_workers": 8,
+        "schedule": "linear",
+        "steps": 1000,
+        "n_classes": 10,
+        "uncond_per" : 0.12, 
+        
+        "model": {
+            "img_ch": 1,
+            "base_ch": 32,
+            "ch_mul": [1, 2, 2, 4],
+            "attn": [],
+            "n_resblocks": 1,
+            "tdim": 256,
+        },
 
-    parser.add_argument("--train_file_path", type=str, default="cifar10_data.pkl")
-    parser.add_argument("--val_file_path", type=str, default="cifar10_data.pkl")
-    parser.add_argument("--schedule", type=str, choices=["linear","cosine"])
+        "training": {
+            "learning_rate": 2e-4,
+            "epochs": 400,
+            "batch_size": 128,
+            "shuffle": True,
+            "warmup_epochs": 20,
+            "eta_min": 1e-6,
+        },
 
-    parser.add_argument("--steps", type=int, default=1000)
+        "logging": {
+            "save_every_n_epochs": 50,
+            "validate_every_epoch": 25,
+            "weights_dir": "mnist_clsfree",
+        },
 
-    parser.add_argument("--img_ch", type=int, default=3)
-    parser.add_argument("--time_dim", type=int, default=256)
-
-    parser.add_argument("--learning_rate", type=float, default=2e-4)
-    parser.add_argument("--epochs", type=int, default=600)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--shuffle", type=bool, default=True)
-    parser.add_argument("--save_every_n_epochs", type=int, default=150)
-    parser.add_argument("--save_every_n_iteration_percentage", type=int, default=110)
-    parser.add_argument("--validation_every_n_iteration_percentage", type=int, default=110)
-    parser.add_argument("--validate_every_epoch", type=int, default=25)    
-    parser.add_argument("--random_seed", type=int, default=42)
-    parser.add_argument("--beta1", type=float, default=0.9)
-    parser.add_argument("--beta2", type=float, default=0.98)
-    parser.add_argument("--eps", type=float, default=1e-9)
-    parser.add_argument("--weights_dir", type=str, default="cifar_1")
-    parser.add_argument("--log_file", type=str, default="train.log")
-    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
-
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-
-    args = parser.parse_args()
-
-    # Enter the path to resume training
-    weights_path = None
-    args.resume_from = weights_path
-
-    # While resuming, all the args are overwritten by the args in the pt file 
-    checkpoint_config = None
-    resume = False
-    if args.resume_from and os.path.isfile(args.resume_from):
-        checkpoint_config = torch.load(args.resume_from)
-        args = Namespace(**checkpoint_config["training_config"])
-        args.resume_from = weights_path
-        resume = True
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "seed": 42,
+    }
     
-    train(args, checkpoint_config, resume)
+    print(config)
+    train(config)
