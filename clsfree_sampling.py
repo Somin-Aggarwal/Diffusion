@@ -47,15 +47,15 @@ print(labels)
 sqrt_one_minus_alphas_cumprod = data['sqrt_one_minus_alphas_cumprod']
 
 with torch.no_grad():
-    for time_step in tqdm(reversed(range(1, steps + 1))):
+    for time_step in tqdm(reversed(range(1, steps + 1)),total=steps):
         t_idx = time_step - 1
         t = torch.tensor(t_idx, dtype=torch.int, device=device).view(1)
 
         predicted_noise_cond = model(new_image, t, labels)
         pred_score_cond = - ( predicted_noise_cond / sqrt_one_minus_alphas_cumprod[t_idx] )
         
-        labels = torch.tensor([10]*batch_size,dtype=torch.int,device=device).view(batch_size)
-        predicted_noise_uncond = model(new_image, t, labels)
+        null_labels = torch.tensor([10]*batch_size,dtype=torch.int,device=device).view(batch_size)
+        predicted_noise_uncond = model(new_image, t, null_labels)
         pred_score_uncond = - ( predicted_noise_uncond / sqrt_one_minus_alphas_cumprod[t_idx] )
         
         weight = 0.9
