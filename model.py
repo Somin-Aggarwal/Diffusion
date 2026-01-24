@@ -163,7 +163,7 @@ class ResBlock(nn.Module):
         self.silu = nn.SiLU()
         
         self.tdim = tdim
-        self.emb_linear = nn.Sequential(
+        self.time_linear = nn.Sequential(
             nn.SiLU(),
             nn.Linear(tdim,out_channels)
         )
@@ -182,7 +182,7 @@ class ResBlock(nn.Module):
         out = self.silu(out)
         out = self.conv1(out)
         
-        t_emb = self.emb_linear(emb)
+        t_emb = self.time_linear(emb)
         out = out + t_emb[:,:,None,None]
 
         out = self.gn2(out)
